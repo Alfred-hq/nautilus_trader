@@ -18,6 +18,7 @@
 use std::{cmp::Ordering, collections::BTreeMap};
 
 use nautilus_core::nanos::UnixNanos;
+use rust_decimal::Decimal;
 
 use crate::{
     data::order::{BookOrder, OrderId},
@@ -51,6 +52,7 @@ impl BookLevel {
         }
     }
 
+    /// Creates a new price level from an order, using the order's price and side.
     #[must_use]
     pub fn from_order(order: BookOrder) -> Self {
         let mut level = Self {
@@ -62,16 +64,19 @@ impl BookLevel {
         level
     }
 
+    /// Returns the number of orders at this price level.
     #[must_use]
     pub fn len(&self) -> usize {
         self.orders.len()
     }
 
+    /// Returns true if this price level has no orders.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.orders.is_empty()
     }
 
+    /// Returns a reference to the first order at this price level in FIFO order.
     #[must_use]
     pub fn first(&self) -> Option<&BookOrder> {
         self.insertion_order
@@ -79,7 +84,7 @@ impl BookLevel {
             .and_then(|&id| self.orders.get(&id))
     }
 
-    /// Returns the orders in the insertion order.
+    /// Returns all orders at this price level in FIFO insertion order.
     #[must_use]
     pub fn get_orders(&self) -> Vec<BookOrder> {
         self.insertion_order
@@ -89,16 +94,25 @@ impl BookLevel {
             .collect()
     }
 
+    /// Returns the total size of all orders at this price level as a float.
     #[must_use]
     pub fn size(&self) -> f64 {
         self.orders.values().map(|o| o.size.as_f64()).sum()
     }
 
+    /// Returns the total size of all orders at this price level as raw integer units.
     #[must_use]
     pub fn size_raw(&self) -> u64 {
         self.orders.values().map(|o| o.size.raw).sum()
     }
 
+    /// Returns the total size of all orders at this price level as a decimal.
+    #[must_use]
+    pub fn size_decimal(&self) -> Decimal {
+        self.orders.values().map(|o| o.size.as_decimal()).sum()
+    }
+
+    /// Returns the total exposure (price * size) of all orders at this price level as a float.
     #[must_use]
     pub fn exposure(&self) -> f64 {
         self.orders
@@ -107,6 +121,7 @@ impl BookLevel {
             .sum()
     }
 
+    /// Returns the total exposure (price * size) of all orders at this price level as raw integer units.
     #[must_use]
     pub fn exposure_raw(&self) -> u64 {
         self.orders
@@ -115,6 +130,7 @@ impl BookLevel {
             .sum()
     }
 
+    /// Adds multiple orders to this price level in FIFO order. Orders must match the level's price.
     pub fn add_bulk(&mut self, orders: Vec<BookOrder>) {
         self.insertion_order
             .extend(orders.iter().map(|o| o.order_id));
@@ -125,6 +141,7 @@ impl BookLevel {
         }
     }
 
+    /// Adds an order to this price level. Order must match the level's price.
     pub fn add(&mut self, order: BookOrder) {
         self.check_order_for_this_level(&order);
 
@@ -132,6 +149,8 @@ impl BookLevel {
         self.insertion_order.push(order.order_id);
     }
 
+    /// Updates an existing order at this price level. Updated order must match the level's price.
+    /// Removes the order if size becomes zero.
     pub fn update(&mut self, order: BookOrder) {
         self.check_order_for_this_level(&order);
 
@@ -143,11 +162,13 @@ impl BookLevel {
         }
     }
 
+    /// Deletes an order from this price level.
     pub fn delete(&mut self, order: &BookOrder) {
         self.orders.remove(&order.order_id);
         self.update_insertion_order();
     }
 
+    /// Removes an order by its ID. Panics if the order doesn't exist.
     pub fn remove_by_id(&mut self, order_id: OrderId, sequence: u64, ts_event: UnixNanos) {
         assert!(
             self.orders.remove(&order_id).is_some(),
@@ -162,8 +183,14 @@ impl BookLevel {
     }
 
     fn update_insertion_order(&mut self) {
-        self.insertion_order
-            .retain(|&id| self.orders.contains_key(&id));
+        if self
+            .insertion_order
+            .iter()
+            .any(|id| !self.orders.contains_key(id))
+        {
+            self.insertion_order
+                .retain(|&id| self.orders.contains_key(&id));
+        }
     }
 }
 
@@ -207,6 +234,7 @@ impl Ord for BookLevel {
 #[cfg(test)]
 mod tests {
     use rstest::rstest;
+    use rust_decimal_macros::dec;
 
     use crate::{
         data::order::BookOrder,
@@ -219,6 +247,38 @@ mod tests {
     fn test_empty_level() {
         let level = BookLevel::new(BookPrice::new(Price::from("1.00"), OrderSide::Buy));
         assert!(level.first().is_none());
+    }
+
+    #[rstest]
+    fn test_level_from_order() {
+        let order = BookOrder::new(OrderSide::Buy, Price::from("1.00"), Quantity::from(10), 1);
+        let level = BookLevel::from_order(order);
+
+        assert_eq!(level.price.value, Price::from("1.00"));
+        assert_eq!(level.price.side, OrderSide::Buy);
+        assert_eq!(level.len(), 1);
+        assert_eq!(level.first().unwrap(), &order);
+        assert_eq!(level.size(), 10.0);
+    }
+
+    #[rstest]
+    #[should_panic(expected = "assertion `left == right` failed")]
+    fn test_add_order_incorrect_price_level() {
+        let mut level = BookLevel::new(BookPrice::new(Price::from("1.00"), OrderSide::Buy));
+        let incorrect_price_order =
+            BookOrder::new(OrderSide::Buy, Price::from("2.00"), Quantity::from(10), 1);
+        level.add(incorrect_price_order);
+    }
+
+    #[rstest]
+    #[should_panic(expected = "assertion `left == right` failed")]
+    fn test_add_bulk_orders_incorrect_price() {
+        let mut level = BookLevel::new(BookPrice::new(Price::from("1.00"), OrderSide::Buy));
+        let orders = vec![
+            BookOrder::new(OrderSide::Buy, Price::from("1.00"), Quantity::from(10), 1),
+            BookOrder::new(OrderSide::Buy, Price::from("2.00"), Quantity::from(20), 2), // Incorrect price
+        ];
+        level.add_bulk(orders);
     }
 
     #[rstest]
@@ -238,7 +298,7 @@ mod tests {
     }
 
     #[rstest]
-    fn test_add_one_order() {
+    fn test_add_single_order() {
         let mut level = BookLevel::new(BookPrice::new(Price::from("1.00"), OrderSide::Buy));
         let order = BookOrder::new(OrderSide::Buy, Price::from("1.00"), Quantity::from(10), 0);
 
@@ -264,6 +324,21 @@ mod tests {
     }
 
     #[rstest]
+    fn test_get_orders() {
+        let mut level = BookLevel::new(BookPrice::new(Price::from("1.00"), OrderSide::Buy));
+        let order1 = BookOrder::new(OrderSide::Buy, Price::from("1.00"), Quantity::from(10), 1);
+        let order2 = BookOrder::new(OrderSide::Buy, Price::from("1.00"), Quantity::from(20), 2);
+
+        level.add(order1);
+        level.add(order2);
+
+        let orders = level.get_orders();
+        assert_eq!(orders.len(), 2);
+        assert_eq!(orders[0], order1); // Checks FIFO order maintained
+        assert_eq!(orders[1], order2);
+    }
+
+    #[rstest]
     fn test_update_order() {
         let mut level = BookLevel::new(BookPrice::new(Price::from("1.00"), OrderSide::Buy));
         let order1 = BookOrder::new(OrderSide::Buy, Price::from("1.00"), Quantity::from(10), 0);
@@ -277,6 +352,43 @@ mod tests {
     }
 
     #[rstest]
+    fn test_fifo_order_after_updates() {
+        let mut level = BookLevel::new(BookPrice::new(Price::from("1.00"), OrderSide::Buy));
+
+        let order1 = BookOrder::new(OrderSide::Buy, Price::from("1.00"), Quantity::from(10), 1);
+        let order2 = BookOrder::new(OrderSide::Buy, Price::from("1.00"), Quantity::from(20), 2);
+
+        level.add(order1.clone());
+        level.add(order2.clone());
+
+        // Update order1 size
+        let updated_order1 =
+            BookOrder::new(OrderSide::Buy, Price::from("1.00"), Quantity::from(15), 1);
+        level.update(updated_order1.clone());
+
+        let orders = level.get_orders();
+        assert_eq!(orders.len(), 2);
+        assert_eq!(orders[0], updated_order1); // First order still first
+        assert_eq!(orders[1], order2); // Second order still second
+    }
+
+    #[rstest]
+    #[should_panic(expected = "assertion `left == right` failed")]
+    fn test_update_order_incorrect_price() {
+        let mut level = BookLevel::new(BookPrice::new(Price::from("1.00"), OrderSide::Buy));
+
+        // Add initial order at correct price level
+        let initial_order =
+            BookOrder::new(OrderSide::Buy, Price::from("1.00"), Quantity::from(10), 1);
+        level.add(initial_order);
+
+        // Attempt to update with order at incorrect price level
+        let updated_order =
+            BookOrder::new(OrderSide::Buy, Price::from("2.00"), Quantity::from(20), 1);
+        level.update(updated_order);
+    }
+
+    #[rstest]
     fn test_update_order_with_zero_size() {
         let mut level = BookLevel::new(BookPrice::new(Price::from("1.00"), OrderSide::Buy));
         let order1 = BookOrder::new(OrderSide::Buy, Price::from("1.00"), Quantity::from(10), 0);
@@ -287,6 +399,27 @@ mod tests {
         assert_eq!(level.len(), 0);
         assert_eq!(level.size(), 0.0);
         assert_eq!(level.exposure(), 0.0);
+    }
+
+    #[rstest]
+    fn test_update_insertion_order_optimization() {
+        let mut level = BookLevel::new(BookPrice::new(Price::from("1.00"), OrderSide::Buy));
+
+        // Add orders
+        let order1 = BookOrder::new(OrderSide::Buy, Price::from("1.00"), Quantity::from(10), 1);
+        let order2 = BookOrder::new(OrderSide::Buy, Price::from("1.00"), Quantity::from(20), 2);
+        level.add(order1);
+        level.add(order2);
+
+        // Update with same orders - should not rebuild insertion_order
+        let initial_insertion_order = level.insertion_order.clone();
+        level.update_insertion_order();
+        assert_eq!(level.insertion_order, initial_insertion_order);
+
+        // Remove an order
+        level.orders.remove(&1);
+        level.update_insertion_order();
+        assert_eq!(level.insertion_order, vec![2]);
     }
 
     #[rstest]
@@ -317,7 +450,7 @@ mod tests {
     }
 
     #[rstest]
-    fn test_remove_order() {
+    fn test_remove_order_by_id() {
         let mut level = BookLevel::new(BookPrice::new(Price::from("1.00"), OrderSide::Buy));
         let order1_id = 0;
         let order1 = BookOrder::new(
@@ -369,6 +502,22 @@ mod tests {
     }
 
     #[rstest]
+    fn test_maximum_order_id() {
+        let mut level = BookLevel::new(BookPrice::new(Price::from("1.00"), OrderSide::Buy));
+
+        let order = BookOrder::new(
+            OrderSide::Buy,
+            Price::from("1.00"),
+            Quantity::from(10),
+            u64::MAX,
+        );
+        level.add(order.clone());
+
+        assert_eq!(level.len(), 1);
+        assert_eq!(level.first().unwrap(), &order);
+    }
+
+    #[rstest]
     #[should_panic(
         expected = "Integrity error: order not found: order_id=1, sequence=2, ts_event=3"
     )]
@@ -397,6 +546,17 @@ mod tests {
         level.add(order1);
         level.add(order2);
         assert_eq!(level.size_raw(), 30_000_000_000);
+    }
+
+    #[rstest]
+    fn test_size_decimal() {
+        let mut level = BookLevel::new(BookPrice::new(Price::from("2.00"), OrderSide::Buy));
+        let order1 = BookOrder::new(OrderSide::Buy, Price::from("2.00"), Quantity::from(10), 0);
+        let order2 = BookOrder::new(OrderSide::Buy, Price::from("2.00"), Quantity::from(20), 1);
+
+        level.add(order1);
+        level.add(order2);
+        assert_eq!(level.size_decimal(), dec!(30.0));
     }
 
     #[rstest]
