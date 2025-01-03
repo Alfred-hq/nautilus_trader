@@ -304,7 +304,9 @@ class DYDXExecutionClient(LiveExecutionClient):
         )
 
         while self.get_account() is None:
+            self._log.info("Account info is None. Waiting for retry..")
             await asyncio.sleep(0.1)
+            self._log.info("Wait Completed")
 
         account = self.get_account()
         instruments = self._instrument_provider.get_all()
