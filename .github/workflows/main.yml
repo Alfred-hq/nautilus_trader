@@ -44,10 +44,13 @@ jobs:
 
 
       - name: Build and Push Nautilus Docker Images
-        run: |
-          branch_name="${{steps.branch-name.outputs.BRANCH_NAME}}"
-          cd ./
-          docker build -t ${{ env.REGISTRY }}/alfred-hq/nautilus-build-${branch_name}:${{ steps.get_commit_hash.outputs.hash }} -t ${{ env.REGISTRY }}/alfred-hq/nautilus-build-${branch_name}:latest -f nautilus_trader.Dockerfile .  || exit 1
-          docker push ${{ env.REGISTRY }}/alfred-hq/nautilus-build-${branch_name}:${{ steps.get_commit_hash.outputs.hash }} || exit 1
-          docker push ${{ env.REGISTRY }}/alfred-hq/nautilus-build-${branch_name}:latest || exit 1
-
+        uses: depot/build-push-action@v1
+        with:
+          push: true
+          tags: ${{ env.REGISTRY }}/alfred-hq/nautilus-build-${branch_name}:${{ steps.get_commit_hash.outputs.hash }} , ${{ env.REGISTRY }}/alfred-hq/nautilus-build-${branch_name}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          platforms: linux/amd64
+          file: ./nautilus_trader.Dockerfile
+          project: 84d6w3lcrg
+        
