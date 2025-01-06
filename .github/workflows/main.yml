@@ -52,5 +52,5 @@ jobs:
           cache-to: type=gha,mode=max
           platforms: linux/amd64
           file: ./nautilus_trader.Dockerfile
-          project: 84d6w3lcrg
+          project: bcw8bx208d
         
