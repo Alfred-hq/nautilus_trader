@@ -21,8 +21,10 @@ from pathlib import Path
 
 import msgspec
 import pytest
+from unittest.mock import Mock
 
 from nautilus_trader.adapters.dydx.common.constants import DYDX_VENUE
+from nautilus_trader.adapters.dydx.common.constants import DEFAULT_CURRENCY
 from nautilus_trader.adapters.dydx.common.enums import DYDXEnumParser
 from nautilus_trader.adapters.dydx.common.enums import DYDXPerpetualPositionStatus
 from nautilus_trader.adapters.dydx.common.symbol import DYDXSymbol
@@ -35,7 +37,7 @@ from nautilus_trader.adapters.dydx.schemas.account.asset_positions import DYDXAs
 from nautilus_trader.adapters.dydx.schemas.account.fills import DYDXFillsResponse
 from nautilus_trader.adapters.dydx.schemas.account.orders import DYDXOrderResponse
 from nautilus_trader.adapters.dydx.schemas.account.perpetual_positions import DYDXPerpetualPositionsResponse
-
+from nautilus_trader.adapters.dydx.schemas.ws import DYDXWsSubaccountsSubscribedContents
 # fmt: on
 from nautilus_trader.core.nautilus_pyo3 import PositionSide
 from nautilus_trader.core.uuid import UUID4
@@ -60,7 +62,7 @@ from nautilus_trader.model.objects import MarginBalance
 from nautilus_trader.model.objects import Money
 from nautilus_trader.model.objects import Price
 from nautilus_trader.model.objects import Quantity
-
+from nautilus_trader.model.objects import AccountBalance
 
 @pytest.fixture
 def list_perpetual_markets_response() -> DYDXListPerpetualMarketsResponse:
@@ -615,3 +617,44 @@ def test_parse_to_instrument(
     assert result.ts_event == expected_result.ts_event
     assert result.ts_init == expected_result.ts_init
     assert result.info == expected_result.info
+
+def test_parse_to_account_balances_with_subaccount():
+    """
+    Test parsing the subaccount message into an account balance.
+    """
+    # Prepare
+    subaccount_mock = Mock()
+    subaccount_mock.freeCollateral = "90.461932"
+    subaccount_mock.equity = "90.466932"
+    contents = DYDXWsSubaccountsSubscribedContents(subaccount=subaccount_mock)
+    expected_result = [
+        AccountBalance(
+            total=Money(Decimal("90.466932"), Currency.from_str(DEFAULT_CURRENCY)),
+            locked=Money(Decimal("0.005"), Currency.from_str(DEFAULT_CURRENCY)),
+            free=Money(Decimal("90.461932"), Currency.from_str(DEFAULT_CURRENCY)),
+        )
+    ]
+    # Act
+    result = contents.parse_to_account_balances()
+    # Assert
+    assert result == expected_result
+    assert result[0].total == expected_result[0].total
+    assert result[0].locked == expected_result[0].locked
+    assert result[0].free == expected_result[0].free
+    assert result[0].total.currency == expected_result[0].total.currency
+    assert result[0].locked.currency == expected_result[0].locked.currency
+    assert result[0].free.currency == expected_result[0].free.currency
+    assert result[0].free.currency.name == expected_result[0].free.currency.name
+
+
+def test_parse_to_account_balances_without_subaccount():
+    """
+    Test parsing the subaccount message without a subaccount.
+    """
+    # Prepare
+    contents = DYDXWsSubaccountsSubscribedContents(subaccount=None)
+    expected_result = []
+    # Act
+    result = contents.parse_to_account_balances()
+    # Assert
+    assert result == expected_result
