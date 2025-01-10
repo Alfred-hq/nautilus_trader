@@ -79,7 +79,6 @@ from nautilus_trader.live.retry import RetryManagerPool
 from nautilus_trader.model.enums import AccountType
 from nautilus_trader.model.enums import OmsType
 from nautilus_trader.model.enums import OrderSide
-from nautilus_trader.model.enums import OrderStatus
 from nautilus_trader.model.enums import OrderType
 from nautilus_trader.model.enums import PositionSide
 from nautilus_trader.model.enums import TimeInForce
@@ -303,6 +302,18 @@ class DYDXExecutionClient(LiveExecutionClient):
             account_number=account.account_number,
             sequence=account.sequence,
         )
+
+        while self.get_account() is None:
+            self._log.info("DyDx Account info is None. Waiting for 0.1s before retrying...")
+            await asyncio.sleep(0.1)
+            self._log.info("Wait of 0.1 seconds to retry DyDx account info completed. Checking DyDx account info again...")
+
+        account = self.get_account()
+        instruments = self._instrument_provider.get_all()
+
+        for instrument_id, instrument in instruments.items():
+            leverage = Decimal(1) / instrument.margin_init
+            account.set_leverage(instrument_id, leverage)
 
     async def _disconnect(self) -> None:
         await self._ws_client.unsubscribe_account_update(
@@ -885,19 +896,19 @@ class DYDXExecutionClient(LiveExecutionClient):
                 venue_order_id=report.venue_order_id,
                 ts_event=report.ts_last,
             )
-        elif order_msg.status in (DYDXOrderStatus.BEST_EFFORT_CANCELED, DYDXOrderStatus.CANCELED):
-            if order.status != OrderStatus.CANCELED:
-                self.generate_order_canceled(
-                    strategy_id=strategy_id,
-                    instrument_id=report.instrument_id,
-                    client_order_id=report.client_order_id,
-                    venue_order_id=report.venue_order_id,
-                    ts_event=report.ts_last,
-                )
-        elif order_msg.status == DYDXOrderStatus.FILLED:
-            # Skip order filled message. The _handle_fill_message generates
+        elif order_msg.status == DYDXOrderStatus.CANCELED:
+            self.generate_order_canceled(
+                strategy_id=strategy_id,
+                instrument_id=report.instrument_id,
+                client_order_id=report.client_order_id,
+                venue_order_id=report.venue_order_id,
+                ts_event=report.ts_last,
+            )
+        elif order_msg.status in (DYDXOrderStatus.FILLED, DYDXOrderStatus.BEST_EFFORT_CANCELED):
+            # Skip order filled message and best effort canceled message. The _handle_fill_message generates
             # a fill report.
-            self._log.debug(f"Skip order fill message: {order_msg}")
+            # Best effort canceled is not a terminal state. Hence, we keep the state at accepted.
+            self._log.debug(f"Skip order message: {order_msg}")
         else:
             message = f"Unknown order status `{order_msg.status}`"
             self._log.error(message)
@@ -1102,11 +1113,15 @@ class DYDXExecutionClient(LiveExecutionClient):
         if order.order_type == OrderType.LIMIT:
             price = order.price.as_double()
         elif order.order_type == OrderType.MARKET:
-            price = (
-                dydx_order_tags.market_order_price.as_double()
-                if dydx_order_tags.market_order_price is not None
-                else 0
-            )
+            if order.side == OrderSide.BUY:
+                price = 200000
+            else:
+                price = 0
+            # price = (
+            #     dydx_order_tags.market_order_price.as_double()
+            #     if dydx_order_tags.market_order_price is not None
+            #     else 0
+            # )
         elif order.order_type == OrderType.STOP_LIMIT:
             price = order.price.as_double()
             trigger_price = order.trigger_price.as_double()
