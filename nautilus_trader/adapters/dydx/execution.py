@@ -1103,7 +1103,7 @@ class DYDXExecutionClient(LiveExecutionClient):
             size=order.quantity.as_double(),
             clientId=client_order_id_int,
             subaccountNumber=self._subaccount,
-            marketId=order.instrument_id.symbol,
+            marketId=order.instrument_id.symbol.replace("-PERP", ""),
             orderSide=order_side_map[order.side],
             price=price,
             triggerPrice=trigger_price,
@@ -1595,7 +1595,7 @@ class DYDXExecutionClient(LiveExecutionClient):
                 func=self._trade_api.post_cancel_order,
                 clientId=client_id,
                 subaccountNumber=subaccount_number,
-                marketId=order.instrument_id.symbol,
+                marketId=order.instrument_id.symbol.replace("-PERP", ""),
                 good_til_date_secs=good_til_date_secs,
                 chainId=self._chainId,
             )
