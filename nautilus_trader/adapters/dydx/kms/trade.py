@@ -143,7 +143,7 @@ class KMSTradeHttpAPI:
         """
         Fetch the subaccount.
         """
-        return await self._endpoint_post_take_profit_order.post(
+        return await self._endpoint_post_cancel_order.post(
             KMSCancelOrderPostParams(
                 clientId=clientId,
                 subaccountNumber=subaccountNumber,
