@@ -147,7 +147,7 @@ class KMSHttpClient:
         self.headers["Authorization"] = f"Bearer {id_token}"
         response: HttpResponse = await self._client.request(
             http_method,
-            url=self._base_url + url_path,
+            url=f"{self._base_url}/api/dydxv4{url_path}",
             headers=self._headers,
             body=msgspec.json.encode(payload) if payload else None,
             keys=ratelimiter_keys,

@@ -30,7 +30,7 @@ class KMSCancelOrderPostParams(msgspec.Struct, omit_defaults=True):
     clientId: int
     subaccountNumber: int
     marketId: str
-    good_til_date_secs: int
+    goodTilTimeInSeconds: int
     chainId: str = "dydx-testnet-v4"
 
 

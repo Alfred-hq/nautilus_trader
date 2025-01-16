@@ -149,6 +149,6 @@ class KMSTradeHttpAPI:
                 subaccountNumber=subaccountNumber,
                 marketId=marketId,
                 chainId=chainId,
-                good_til_date_secs=good_til_date_secs,
+                goodTilTimeInSeconds=good_til_date_secs,
             ),
         )
