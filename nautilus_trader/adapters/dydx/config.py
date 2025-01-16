@@ -81,9 +81,10 @@ class DYDXExecClientConfig(LiveExecClientConfig, frozen=True):
 
     wallet_address: str | None = None
     subaccount: int = 0
-    mnemonic: str | None = None
     base_url_http: str | None = None
     base_url_ws: str | None = None
     is_testnet: bool = False
     max_retries: PositiveInt | None = None
     retry_delay: PositiveFloat | None = None
+    chainId: str | None = None
+    base_url_kms: str | None = None
