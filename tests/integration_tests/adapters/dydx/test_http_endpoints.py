@@ -617,3 +617,44 @@ def test_parse_to_instrument(
     assert result.ts_event == expected_result.ts_event
     assert result.ts_init == expected_result.ts_init
     assert result.info == expected_result.info
+
+def test_parse_to_account_balances_with_subaccount():
+    """
+    Test parsing the subaccount message into an account balance.
+    """
+    # Prepare
+    subaccount_mock = Mock()
+    subaccount_mock.freeCollateral = "90.461932"
+    subaccount_mock.equity = "90.466932"
+    contents = DYDXWsSubaccountsSubscribedContents(subaccount=subaccount_mock)
+    expected_result = [
+        AccountBalance(
+            total=Money(Decimal("90.466932"), Currency.from_str(DEFAULT_CURRENCY)),
+            locked=Money(Decimal("0.005"), Currency.from_str(DEFAULT_CURRENCY)),
+            free=Money(Decimal("90.461932"), Currency.from_str(DEFAULT_CURRENCY)),
+        )
+    ]
+    # Act
+    result = contents.parse_to_account_balances()
+    # Assert
+    assert result == expected_result
+    assert result[0].total == expected_result[0].total
+    assert result[0].locked == expected_result[0].locked
+    assert result[0].free == expected_result[0].free
+    assert result[0].total.currency == expected_result[0].total.currency
+    assert result[0].locked.currency == expected_result[0].locked.currency
+    assert result[0].free.currency == expected_result[0].free.currency
+    assert result[0].free.currency.name == expected_result[0].free.currency.name
+
+
+def test_parse_to_account_balances_without_subaccount():
+    """
+    Test parsing the subaccount message without a subaccount.
+    """
+    # Prepare
+    contents = DYDXWsSubaccountsSubscribedContents(subaccount=None)
+    expected_result = []
+    # Act
+    result = contents.parse_to_account_balances()
+    # Assert
+    assert result == expected_result
