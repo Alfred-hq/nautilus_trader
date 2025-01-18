@@ -674,6 +674,12 @@ async fn process_commands(
         tokio::select! {
             // Handle incoming messages and write to SurrealKV
             Some(msg) = rx.recv() => {
+                // Skip storing `DatabaseOperation::Close`
+                if let DatabaseOperation::Close = msg.op_type {
+                    tracing::info!("Received DatabaseOperation::Close. Skipping SurrealKV write.");
+                    continue;
+                }
+
                 if let Err(e) = write_to_wal_store(&store, msg).await {
                     tracing::error!("Failed to write to SurrealKV: {}", e);
                 }
