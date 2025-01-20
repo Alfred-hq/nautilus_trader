@@ -30,6 +30,7 @@ from nautilus_trader.adapters.dydx.execution import DYDXExecutionClient
 from nautilus_trader.adapters.dydx.grpc.account import DYDXAccountGRPCAPI
 from nautilus_trader.adapters.dydx.grpc.account import TransactionBuilder
 from nautilus_trader.adapters.dydx.http.client import DYDXHttpClient
+from nautilus_trader.adapters.dydx.kms.client import KMSHttpClient
 from nautilus_trader.adapters.dydx.providers import DYDXInstrumentProvider
 from nautilus_trader.cache.cache import Cache
 from nautilus_trader.common.component import LiveClock
@@ -89,6 +90,37 @@ def get_dydx_http_client(
     """
     http_base_url = base_url or get_http_base_url(is_testnet)
     return DYDXHttpClient(
+        clock=clock,
+        base_url=http_base_url,
+    )
+
+
+@lru_cache(1)
+def get_kms_http_client(
+    clock: LiveClock,
+    base_url: str,
+) -> KMSHttpClient:
+    """
+    Cache and return a dYdX HTTP client with the given key and secret.
+
+    If a cached client with matching parameters already exists, the cached client will be returned.
+
+    Parameters
+    ----------
+    clock : LiveClock
+        The clock for the client.
+    base_url : str, optional
+        The base URL for the API endpoints.
+    is_testnet : bool, default False
+        If the client is connecting to the testnet API.
+
+    Returns
+    -------
+    DYDXHttpClient
+
+    """
+    http_base_url = base_url
+    return KMSHttpClient(
         clock=clock,
         base_url=http_base_url,
     )
@@ -240,6 +272,10 @@ class DYDXLiveExecClientFactory(LiveExecClientFactory):
             base_url=config.base_url_http,
             is_testnet=config.is_testnet,
         )
+        trade_client: KMSHttpClient = get_kms_http_client(
+            clock=clock,
+            base_url=config.base_url_kms,
+        )
         wallet_address = config.wallet_address or get_wallet_address(is_testnet=config.is_testnet)
         provider = get_dydx_instrument_provider(
             client=client,
@@ -260,4 +296,5 @@ class DYDXLiveExecClientFactory(LiveExecClientFactory):
             base_url_ws=config.base_url_ws or ws_base_url,
             config=config,
             name=name,
+            trade_client=trade_client,
         )

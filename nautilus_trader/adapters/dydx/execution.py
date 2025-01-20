@@ -49,7 +49,10 @@ from nautilus_trader.adapters.dydx.http.account import DYDXAccountHttpAPI
 from nautilus_trader.adapters.dydx.http.client import DYDXHttpClient
 from nautilus_trader.adapters.dydx.http.errors import DYDXError
 from nautilus_trader.adapters.dydx.http.errors import should_retry
+from nautilus_trader.adapters.dydx.kms.client import KMSHttpClient
+from nautilus_trader.adapters.dydx.kms.trade import KMSTradeHttpAPI
 from nautilus_trader.adapters.dydx.providers import DYDXInstrumentProvider
+from nautilus_trader.adapters.dydx.schemas.kms.order import KMSOrder
 from nautilus_trader.adapters.dydx.schemas.ws import DYDXWsBlockHeightChannelData
 from nautilus_trader.adapters.dydx.schemas.ws import DYDXWsBlockHeightSubscribedData
 from nautilus_trader.adapters.dydx.schemas.ws import DYDXWsFillSubaccountMessageContents
@@ -196,6 +199,7 @@ class DYDXExecutionClient(LiveExecutionClient):
         grpc_account_client: DYDXAccountGRPCAPI,
         base_url_ws: str,
         config: DYDXExecClientConfig,
+        trade_client: KMSHttpClient,
         name: str | None,
     ) -> None:
         """
@@ -220,6 +224,7 @@ class DYDXExecutionClient(LiveExecutionClient):
         self._wallet_address = config.wallet_address or get_wallet_address(
             is_testnet=config.is_testnet,
         )
+        self._chainId = config.chainId
         self._subaccount = config.subaccount
 
         self._enum_parser = DYDXEnumParser()
@@ -240,7 +245,8 @@ class DYDXExecutionClient(LiveExecutionClient):
 
         # GRPC API
         self._grpc_account = grpc_account_client
-        self._mnemonic = config.mnemonic or get_mnemonic(is_testnet=config.is_testnet)
+        # commenting this as now to find the use of this further
+        # self._mnemonic = config.mnemonic or get_mnemonic(is_testnet=config.is_testnet)
 
         # Initialize the wallet in the connect method
         self._wallet: Wallet | None = None
@@ -251,6 +257,8 @@ class DYDXExecutionClient(LiveExecutionClient):
             clock=clock,
         )
 
+        # kms based api for trade
+        self._trade_api = KMSTradeHttpAPI(client=trade_client, clock=clock)
         # Decoders
         self._decoder_ws_msg_general = msgspec.json.Decoder(DYDXWsMessageGeneral)
         self._decoder_ws_msg_subaccounts_subscribed = msgspec.json.Decoder(
@@ -297,11 +305,12 @@ class DYDXExecutionClient(LiveExecutionClient):
         self._block_height = await self._grpc_account.latest_block_height()
 
         account = await self._grpc_account.get_account(address=self._wallet_address)
-        self._wallet = Wallet(
-            mnemonic=self._mnemonic,
-            account_number=account.account_number,
-            sequence=account.sequence,
-        )
+        # self._wallet = Wallet(
+        #     mnemonic=self._mnemonic,
+        #     account_number=account.account_number,
+        #     sequence=account.sequence,
+        # )
+
 
         while self.get_account() is None:
             self._log.info("DyDx Account info is None. Waiting for 0.1s before retrying...")
@@ -1082,52 +1091,186 @@ class DYDXExecutionClient(LiveExecutionClient):
             good_til_date_secs = (
                 int(nanos_to_secs(order.expire_time_ns)) if order.expire_time_ns else None
             )
-
-        order_id = order_builder.create_order_id(
-            address=self._wallet_address,
-            subaccount_number=self._subaccount,
-            client_id=client_order_id_int,
-            order_flags=order_flags,
-        )
-        order_type_map = {
-            OrderType.LIMIT: DYDXGRPCOrderType.LIMIT,
-            OrderType.MARKET: DYDXGRPCOrderType.MARKET,
-            OrderType.STOP_MARKET: DYDXGRPCOrderType.STOP_MARKET,
-            OrderType.STOP_LIMIT: DYDXGRPCOrderType.STOP_LIMIT,
-        }
-        order_side_map = {
-            OrderSide.NO_ORDER_SIDE: DYDXOrder.Side.SIDE_UNSPECIFIED,
-            OrderSide.BUY: DYDXOrder.Side.SIDE_BUY,
-            OrderSide.SELL: DYDXOrder.Side.SIDE_SELL,
-        }
-        time_in_force_map = {
-            TimeInForce.GTC: DYDXOrder.TimeInForce.TIME_IN_FORCE_UNSPECIFIED,
-            TimeInForce.GTD: DYDXOrder.TimeInForce.TIME_IN_FORCE_UNSPECIFIED,
-            TimeInForce.IOC: DYDXOrder.TimeInForce.TIME_IN_FORCE_IOC,
-            TimeInForce.FOK: DYDXOrder.TimeInForce.TIME_IN_FORCE_FILL_OR_KILL,
-        }
-
         price = 0
-        trigger_price = None
+        trigger_price = 0
+        if order.order_type != OrderType.MARKET:
+            price = order.price.as_double()
+            trigger_price = order.trigger_price.as_double()
+        order_side_map = {
+            OrderSide.NO_ORDER_SIDE: "UNSPECIFIED",
+            OrderSide.BUY: "BUY",
+            OrderSide.SELL: "SELL",
+        }
+        order_msg = KMSOrder(
+            size=order.quantity.as_double(),
+            clientId=client_order_id_int,
+            subaccountNumber=self._subaccount,
+            marketId=str(order.instrument_id.symbol).replace("-PERP", ""),
+            orderSide=order_side_map[order.side],
+            price=price,
+            triggerPrice=trigger_price,
+            goodTilTimeInSeconds=good_til_date_secs,
+            chainId=self._chainId,
+            order_type=order.order_type,
+        )
+        # order_id = order_builder.create_order_id(
+        #     address=self._wallet_address,
+        #     subaccount_number=self._subaccount,
+        #     client_id=client_order_id_int,
+        #     order_flags=order_flags,
+        # )
+        # order_type_map = {
+        #     OrderType.LIMIT: DYDXGRPCOrderType.LIMIT,
+        #     OrderType.MARKET: DYDXGRPCOrderType.MARKET,
+        #     OrderType.STOP_MARKET: DYDXGRPCOrderType.STOP_MARKET,
+        #     OrderType.STOP_LIMIT: DYDXGRPCOrderType.STOP_LIMIT,
+        # }
+        # order_side_map = {
+        #     OrderSide.NO_ORDER_SIDE: DYDXOrder.Side.SIDE_UNSPECIFIED,
+        #     OrderSide.BUY: DYDXOrder.Side.SIDE_BUY,
+        #     OrderSide.SELL: DYDXOrder.Side.SIDE_SELL,
+        # }
+        # time_in_force_map = {
+        #     TimeInForce.GTC: DYDXOrder.TimeInForce.TIME_IN_FORCE_UNSPECIFIED,
+        #     TimeInForce.GTD: DYDXOrder.TimeInForce.TIME_IN_FORCE_UNSPECIFIED,
+        #     TimeInForce.IOC: DYDXOrder.TimeInForce.TIME_IN_FORCE_IOC,
+        #     TimeInForce.FOK: DYDXOrder.TimeInForce.TIME_IN_FORCE_FILL_OR_KILL,
+        # }
 
-        if order.order_type == OrderType.LIMIT:
-            price = order.price.as_double()
-        elif order.order_type == OrderType.MARKET:
-            price = (
-                dydx_order_tags.market_order_price.as_double()
-                if dydx_order_tags.market_order_price is not None
-                else 0
+        # price = 0
+        # trigger_price = None
+
+        # if order.order_type == OrderType.LIMIT:
+        #     price = order.price.as_double()
+        # elif order.order_type == OrderType.MARKET:
+        #     price = (
+        #         dydx_order_tags.market_order_price.as_double()
+        #         if dydx_order_tags.market_order_price is not None
+        #         else 0
+        #     )
+        # elif order.order_type == OrderType.STOP_LIMIT:
+        #     price = order.price.as_double()
+        #     trigger_price = order.trigger_price.as_double()
+        # elif order.order_type == OrderType.STOP_MARKET:
+        #     price = (
+        #         dydx_order_tags.market_order_price.as_double()
+        #         if dydx_order_tags.market_order_price is not None
+        #         else 0
+        #     )
+        #     trigger_price = order.trigger_price.as_double()
+        # else:
+        #     rejection_reason = (
+        #         f"Cannot submit order: order type `{order.order_type}` not (yet) supported"
+        #     )
+        #     self.generate_order_rejected(
+        #         strategy_id=order.strategy_id,
+        #         instrument_id=order.instrument_id,
+        #         client_order_id=order.client_order_id,
+        #         reason=rejection_reason,
+        #         ts_event=self._clock.timestamp_ns(),
+        #     )
+        #     return
+
+        # order_msg = order_builder.create_order(
+        #     order_id=order_id,
+        #     order_type=order_type_map[order.order_type],
+        #     side=order_side_map[order.side],
+        #     size=order.quantity.as_double(),
+        #     price=price,
+        #     time_in_force=time_in_force_map[order.time_in_force],
+        #     reduce_only=order.is_reduce_only,
+        #     post_only=order.is_post_only,
+        #     good_til_block=good_til_block,
+        #     good_til_block_time=good_til_date_secs,
+        #     trigger_price=trigger_price,
+        # )
+
+        # await self._place_order(order_msg=order_msg, order=order)
+        await self._place_order_trade_api(order_msg=order_msg, order=order)
+
+    async def _place_order(self, order_msg: DYDXOrder, order: Order):
+        # commented this code as we are trading without mnemonic
+        # if self._wallet is None:
+        #     rejection_reason = "Cannot submit order: no wallet available"
+        #     self._log.error(rejection_reason)
+
+        #     self.generate_order_rejected(
+        #         strategy_id=order.strategy_id,
+        #         instrument_id=order.instrument_id,
+        #         client_order_id=order.client_order_id,
+        #         reason=rejection_reason,
+        #         ts_event=self._clock.timestamp_ns(),
+        #     )
+        #     return
+        async with self._retry_manager_pool as retry_manager:
+            await retry_manager.run(
+                name="place_order",
+                details=[order.client_order_id],
+                func=self._grpc_account.place_order,
+                wallet=self._wallet,
+                order=order_msg,
             )
-        elif order.order_type == OrderType.STOP_LIMIT:
-            price = order.price.as_double()
-            trigger_price = order.trigger_price.as_double()
-        elif order.order_type == OrderType.STOP_MARKET:
-            price = (
-                dydx_order_tags.market_order_price.as_double()
-                if dydx_order_tags.market_order_price is not None
-                else 0
-            )
-            trigger_price = order.trigger_price.as_double()
+            # there is no code to handle response the response
+            # is just use to check if the order is created or not
+            if not retry_manager.result:
+                self.generate_order_rejected(
+                    strategy_id=order.strategy_id,
+                    instrument_id=order.instrument_id,
+                    client_order_id=order.client_order_id,
+                    reason=retry_manager.message,
+                    ts_event=self._clock.timestamp_ns(),
+                )
+
+    async def _place_order_trade_api(self, order_msg: KMSOrder, order: Order):
+        temp_price = order_msg.price
+        if order_msg.order_type == OrderType.MARKET:
+            if order_msg.orderSide == "BUY":
+                temp_price = 200000
+            async with self._retry_manager_pool as retry_manager:
+                await retry_manager.run(
+                    name="place_market_order",
+                    details=[order_msg.clientId],
+                    func=self._trade_api.post_market_order,
+                    size=order_msg.size,
+                    clientId=order_msg.clientId,
+                    subaccountNumber=order_msg.subaccountNumber,
+                    marketId=order_msg.marketId,
+                    orderSide=order_msg.orderSide,
+                    price=temp_price,
+                    chainId=order_msg.chainId,
+                )
+            if not retry_manager.result:
+                self.generate_order_rejected(
+                    strategy_id=order.strategy_id,
+                    instrument_id=order.instrument_id,
+                    client_order_id=order.client_order_id,
+                    reason=retry_manager.message,
+                    ts_event=self._clock.timestamp_ns(),
+                )
+        elif order_msg.order_type == OrderType.STOP_LIMIT:
+            async with self._retry_manager_pool as retry_manager:
+                await retry_manager.run(
+                    name="place_stop_limit_order",
+                    details=[order_msg.clientId],
+                    func=self._trade_api.post_stop_limit_order,
+                    size=order_msg.size,
+                    clientId=order_msg.clientId,
+                    subaccountNumber=order_msg.subaccountNumber,
+                    marketId=order_msg.marketId,
+                    orderSide=order_msg.orderSide,
+                    price=temp_price,
+                    chainId=order_msg.chainId,
+                    triggerPrice=order_msg.triggerPrice,
+                    goodTilTimeInSeconds=order_msg.goodTilTimeInSeconds,
+                )
+            if not retry_manager.result:
+                self.generate_order_rejected(
+                    strategy_id=order.strategy_id,
+                    instrument_id=order.instrument_id,
+                    client_order_id=order.client_order_id,
+                    reason=retry_manager.message,
+                    ts_event=self._clock.timestamp_ns(),
+                )
         else:
             rejection_reason = (
                 f"Cannot submit order: order type `{order.order_type}` not (yet) supported"
@@ -1140,53 +1283,6 @@ class DYDXExecutionClient(LiveExecutionClient):
                 ts_event=self._clock.timestamp_ns(),
             )
             return
-
-        order_msg = order_builder.create_order(
-            order_id=order_id,
-            order_type=order_type_map[order.order_type],
-            side=order_side_map[order.side],
-            size=order.quantity.as_double(),
-            price=price,
-            time_in_force=time_in_force_map[order.time_in_force],
-            reduce_only=order.is_reduce_only,
-            post_only=order.is_post_only,
-            good_til_block=good_til_block,
-            good_til_block_time=good_til_date_secs,
-            trigger_price=trigger_price,
-        )
-
-        await self._place_order(order_msg=order_msg, order=order)
-
-    async def _place_order(self, order_msg: DYDXOrder, order: Order):
-        if self._wallet is None:
-            rejection_reason = "Cannot submit order: no wallet available"
-            self._log.error(rejection_reason)
-
-            self.generate_order_rejected(
-                strategy_id=order.strategy_id,
-                instrument_id=order.instrument_id,
-                client_order_id=order.client_order_id,
-                reason=rejection_reason,
-                ts_event=self._clock.timestamp_ns(),
-            )
-            return
-
-        async with self._retry_manager_pool as retry_manager:
-            await retry_manager.run(
-                name="place_order",
-                details=[order.client_order_id],
-                func=self._grpc_account.place_order,
-                wallet=self._wallet,
-                order=order_msg,
-            )
-            if not retry_manager.result:
-                self.generate_order_rejected(
-                    strategy_id=order.strategy_id,
-                    instrument_id=order.instrument_id,
-                    client_order_id=order.client_order_id,
-                    reason=retry_manager.message,
-                    ts_event=self._clock.timestamp_ns(),
-                )
 
     async def _submit_order(self, command: SubmitOrder) -> None:
         await self._submit_order_single(order=command.order)
@@ -1395,9 +1491,15 @@ class DYDXExecutionClient(LiveExecutionClient):
             order_flags=order_flags,
         )
 
-        await self._cancel_order_single_and_retry(
+        # await self._cancel_order_single_and_retry(
+        #     order=order,
+        #     order_id=order_id,
+        #     good_til_date_secs=good_til_date_secs,
+        # )
+        await self._cancel_order_single_and_retry_trade_api(
             order=order,
-            order_id=order_id,
+            subaccount_number=self._subaccount,
+            client_id=client_order_id_int,
             good_til_date_secs=good_til_date_secs,
         )
 
@@ -1407,18 +1509,19 @@ class DYDXExecutionClient(LiveExecutionClient):
         order_id: DYDXOrderId,
         good_til_date_secs: int | None,
     ) -> None:
-        if self._wallet is None:
-            reason = f"Cannot cancel order {order.client_order_id!r}: no wallet available"
-            self._log.error(reason)
-            self.generate_order_cancel_rejected(
-                strategy_id=order.strategy_id,
-                instrument_id=order.instrument_id,
-                client_order_id=order.client_order_id,
-                venue_order_id=order.venue_order_id,
-                reason=reason,
-                ts_event=self._clock.timestamp_ns(),
-            )
-            return
+        # we need to check for the api instead or we can remove the check
+        # if self._wallet is None:
+        #     reason = f"Cannot cancel order {order.client_order_id!r}: no wallet available"
+        #     self._log.error(reason)
+        #     self.generate_order_cancel_rejected(
+        #         strategy_id=order.strategy_id,
+        #         instrument_id=order.instrument_id,
+        #         client_order_id=order.client_order_id,
+        #         venue_order_id=order.venue_order_id,
+        #         reason=reason,
+        #         ts_event=self._clock.timestamp_ns(),
+        #     )
+        #     return
 
         is_expired = (
             nanos_to_secs(self._clock.timestamp_ns()) > good_til_date_secs
@@ -1448,6 +1551,55 @@ class DYDXExecutionClient(LiveExecutionClient):
                 order_id=order_id,
                 good_til_block=self._block_height + 10,
                 good_til_block_time=good_til_date_secs,
+            )
+            if not retry_manager.result:
+                self._log.error(f"Failed to cancel order: {retry_manager.message}")
+                self.generate_order_cancel_rejected(
+                    strategy_id=order.strategy_id,
+                    instrument_id=order.instrument_id,
+                    client_order_id=order.client_order_id,
+                    venue_order_id=order.venue_order_id,
+                    reason=retry_manager.message,
+                    ts_event=self._clock.timestamp_ns(),
+                )
+
+    async def _cancel_order_single_and_retry_trade_api(
+        self,
+        order: Order,
+        subaccount_number: int,
+        client_id: int,
+        good_til_date_secs: int | None,
+    ) -> None:
+
+        is_expired = (
+            nanos_to_secs(self._clock.timestamp_ns()) > good_til_date_secs
+            if good_til_date_secs
+            else False
+        )
+
+        if is_expired:
+            reason = f"Cannot cancel order: order {order.client_order_id!r} is expired"
+            self._log.warning(reason)
+            self.generate_order_cancel_rejected(
+                strategy_id=order.strategy_id,
+                instrument_id=order.instrument_id,
+                client_order_id=order.client_order_id,
+                venue_order_id=order.venue_order_id,
+                reason=reason,
+                ts_event=self._clock.timestamp_ns(),
+            )
+            return
+
+        async with self._retry_manager_pool as retry_manager:
+            await retry_manager.run(
+                name="cancel_order",
+                details=[order.client_order_id, order.venue_order_id],
+                func=self._trade_api.post_cancel_order,
+                clientId=client_id,
+                subaccountNumber=subaccount_number,
+                marketId=str(order.instrument_id.symbol).replace("-PERP", ""),
+                good_til_date_secs=good_til_date_secs,
+                chainId=self._chainId,
             )
             if not retry_manager.result:
                 self._log.error(f"Failed to cancel order: {retry_manager.message}")
