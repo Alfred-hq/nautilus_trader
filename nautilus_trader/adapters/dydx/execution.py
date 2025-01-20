@@ -372,7 +372,7 @@ class DYDXExecutionClient(LiveExecutionClient):
                 subaccount_number=self._subaccount,
                 symbol=instrument_id.symbol.value.removesuffix("-PERP"),
                 order_side=self._enum_parser.parse_nautilus_order_side(order_side),
-                order_type=self._enum_parser.parse_nautilus_order_type(order_type),
+                # order_type=self._enum_parser.parse_nautilus_order_type(order_type),
                 return_latest_orders=True,
             )
 
