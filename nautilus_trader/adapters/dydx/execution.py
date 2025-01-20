@@ -468,7 +468,6 @@ class DYDXExecutionClient(LiveExecutionClient):
                 client_order_id=client_order_id,
                 venue_order_id=venue_order_id,
                 order_side=order.side,
-                order_type=order.order_type,
             )
 
         except DYDXError as e:
