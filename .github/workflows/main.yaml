@@ -1,0 +1,55 @@
+name: Build and Push Docker Images
+
+on:
+  push:
+    branches:
+      - master-production
+      - releases_production
+      - pre-production
+
+env:
+  REGISTRY: ghcr.io
+
+jobs:
+  build_and_push_images:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: 'read'
+      packages: 'write'
+      id-token: 'write'
+    steps:
+      - name: Derive latest image name
+        id: branch-name
+        run: |
+          name=$(echo "${GITHUB_REF#refs/heads/}" | sed 's/\//-/g')
+          echo "branch_name=$name" >> $GITHUB_OUTPUT
+
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Depot
+        uses: depot/setup-action@v1
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v2
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ secrets.ALFRED_FLOW_DOCKER_USERNAME }}
+          password: ${{ secrets.ALFRED_FLOW_DOCKER_PASSWORD }}
+
+      - name: Get commit hash
+        id: get_commit_hash
+        run: echo "hash=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
+
+      - name: Build and Push Nautilus Docker Images
+        uses: depot/build-push-action@v1
+        with:
+          push: true
+          tags: |
+            ${{ env.REGISTRY }}/alfred-hq/nautilus-build-${{ steps.branch-name.outputs.branch_name }}:${{ steps.get_commit_hash.outputs.hash }}
+            ${{ env.REGISTRY }}/alfred-hq/nautilus-build-${{ steps.branch-name.outputs.branch_name }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          platforms: linux/amd64
+          file: ./nautilus_trader.Dockerfile
+          project: 9p1qk6t4xw

@@ -14,9 +14,10 @@
 // -------------------------------------------------------------------------------------------------
 
 use std::{
-    collections::{HashMap, VecDeque},
-    str::FromStr,
-    time::{Duration, Instant},
+    collections::HashMap,
+    str::FromStr, 
+    sync::Arc, 
+    time::Duration
 };
 
 use bytes::Bytes;
@@ -26,6 +27,7 @@ use nautilus_common::{
     enums::SerializationEncoding,
     runtime::get_runtime,
     signal::Signal,
+    msgbus::database::DatabaseConfig, 
 };
 use nautilus_core::{correctness::check_slice_not_empty, nanos::UnixNanos, uuid::UUID4};
 use nautilus_cryptography::providers::install_cryptographic_provider;
@@ -44,17 +46,25 @@ use nautilus_model::{
     types::currency::Currency,
 };
 use redis::{Commands, Connection, Pipeline, RedisError};
+use tokio::sync::Notify;
 use ustr::Ustr;
 
 use super::{REDIS_DELIMITER, REDIS_FLUSHDB};
 use crate::redis::create_redis_connection;
 
+use surrealkv::{Durability, Options, Store, Transaction};
+use anyhow::Result;
+use std::path::PathBuf;
+use serde::Serialize;
+use serde::Deserialize;
+
+use once_cell::sync::Lazy;
+use tokio::runtime::Runtime;
+use std::sync::Mutex;
+
 // Task and connection names
 const CACHE_READ: &str = "cache-read";
 const CACHE_WRITE: &str = "cache-write";
-
-// Error constants
-const FAILED_TX_CHANNEL: &str = "Failed to send to channel";
 
 // Collection keys
 const INDEX: &str = "index";
@@ -82,6 +92,33 @@ const INDEX_ORDERS_INFLIGHT: &str = "index:orders_inflight";
 const INDEX_POSITIONS: &str = "index:positions";
 const INDEX_POSITIONS_OPEN: &str = "index:positions_open";
 const INDEX_POSITIONS_CLOSED: &str = "index:positions_closed";
+const SURREAL_KV_DIR: &str = "./nautilus_embedded_storage";
+const CHANNEL_BUFFER_SIZE: usize = 1;
+const RETRY_DELAY_MS: u64 = 2000; // Define delay between retries in milliseconds
+
+static TOKIO_RUNTIME: Lazy<Runtime> = Lazy::new(|| {
+    Runtime::new().expect("Failed to create global Tokio runtime")
+});
+
+static GLOBAL_DB_CONFIG: Lazy<Mutex<Option<DatabaseConfig>>> = Lazy::new(|| Mutex::new(None));
+
+enum RedisWALKey {
+    NextOperationSequence,          // Key for the next sequence ID to be used for a new operation
+    LastCommittedOperationSequence, // Key for the last sequence that has been committed
+    GetKeyForOperationSequence(u64), // Generates the key for the operation at the given sequence
+}
+
+impl RedisWALKey {
+    fn as_bytes(&self) -> Vec<u8> {
+        match self {
+            RedisWALKey::NextOperationSequence => b"RedisWal/NextOperationSequence".to_vec(),
+            RedisWALKey::LastCommittedOperationSequence => b"RedisWal/LastCommittedOperationSequence".to_vec(),
+            RedisWALKey::GetKeyForOperationSequence(sequence) => {
+                format!("RedisWal/OperationSequence/{}", sequence).into_bytes()
+            }
+        }
+    }
+}
 
 /// A type of database operation.
 #[derive(Clone, Debug)]
@@ -92,7 +129,6 @@ pub enum DatabaseOperation {
     Close,
 }
 
-/// Represents a database command to be performed which may be executed in a task.
 #[derive(Clone, Debug)]
 pub struct DatabaseCommand {
     /// The database operation type.
@@ -101,6 +137,52 @@ pub struct DatabaseCommand {
     pub key: Option<String>,
     /// The data payload for the operation.
     pub payload: Option<Vec<Bytes>>,
+    /// Indicates whether the command has been committed to Redis.
+    pub committed_to_redis: bool, // New field
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct SerializableDatabaseCommand {
+    op_type: String,
+    key: Option<String>,
+    payload: Option<Vec<Bytes>>, // Changed from Vec<String> to Vec<Bytes>
+    committed_to_redis: bool,    // New field
+}
+
+// Conversion from `DatabaseCommand` to `SerializableDatabaseCommand`
+impl From<DatabaseCommand> for SerializableDatabaseCommand {
+    fn from(cmd: DatabaseCommand) -> Self {
+        SerializableDatabaseCommand {
+            op_type: format!("{:?}", cmd.op_type),
+            key: cmd.key,
+            payload: cmd.payload, // Directly assign `Bytes` payload
+            committed_to_redis: cmd.committed_to_redis, // Copy the flag
+        }
+    }
+}
+
+// Conversion from `SerializableDatabaseCommand` to `DatabaseCommand`
+impl TryFrom<SerializableDatabaseCommand> for DatabaseCommand {
+    type Error = String;
+
+    fn try_from(serializable: SerializableDatabaseCommand) -> Result<Self, Self::Error> {
+        let op_type = match serializable.op_type.as_str() {
+            "Insert" => DatabaseOperation::Insert,
+            "Update" => DatabaseOperation::Update,
+            "Delete" => DatabaseOperation::Delete,
+            "Close" => DatabaseOperation::Close,
+            _ => {
+                return Err(format!("Unknown operation type: {}", serializable.op_type));
+            }
+        };
+
+        Ok(DatabaseCommand {
+            op_type,
+            key: serializable.key,
+            payload: serializable.payload, // Directly assign `Bytes` payload
+            committed_to_redis: serializable.committed_to_redis, // Copy the flag
+        })
+    }
 }
 
 impl DatabaseCommand {
@@ -111,6 +193,7 @@ impl DatabaseCommand {
             op_type,
             key: Some(key),
             payload,
+            committed_to_redis: false, // Default to `false` when creating a new command
         }
     }
 
@@ -121,6 +204,7 @@ impl DatabaseCommand {
             op_type: DatabaseOperation::Close,
             key: None,
             payload: None,
+            committed_to_redis: false, // Default to `false`
         }
     }
 }
@@ -133,8 +217,227 @@ pub struct RedisCacheDatabase {
     pub trader_id: TraderId,
     trader_key: String,
     con: Connection,
-    tx: tokio::sync::mpsc::UnboundedSender<DatabaseCommand>,
+    tx: tokio::sync::mpsc::Sender<DatabaseCommand>, // Updated to use a bounded sender
     handle: tokio::task::JoinHandle<()>,
+}
+
+fn create_surrealkv_store() -> Result<Store> {
+    let config = Options {
+        dir: PathBuf::from(SURREAL_KV_DIR), // Persistent storage path
+        disk_persistence: true,
+        isolation_level: surrealkv::IsolationLevel::SerializableSnapshotIsolation,                        // Enable disk persistence
+        ..Default::default()
+    };
+
+    Store::new(config).map_err(|e| anyhow::anyhow!("Failed to create SurrealKV store: {e}"))
+}
+
+fn new_surrealkv_transaction(store: &Store, durability: Durability) -> Result<Transaction> {
+    let mut txn = store.begin()?;
+    txn.set_durability(durability);
+    Ok(txn)
+}
+
+async fn write_to_wal_store(store: &Store, message: DatabaseCommand) -> Result<()> {
+    let mut txn = new_surrealkv_transaction(&store, Durability::Immediate)?;
+    let next_sequence_key = RedisWALKey::NextOperationSequence.as_bytes();
+
+    // Fetch the next sequence value
+    let next_sequence: u64 = if let Some(sequence_bytes) = txn.get(&next_sequence_key)? {
+        serde_json::from_slice(&sequence_bytes)?
+    } else {
+        0 // Default to 0 if sequence doesn't exist
+    };
+
+    // Create the new key for the operation
+    let operation_key = RedisWALKey::GetKeyForOperationSequence(next_sequence).as_bytes();
+    let serializable_command: SerializableDatabaseCommand = message.into();
+
+    // Write the operation to the new key
+    txn.set(&operation_key, &serde_json::to_vec(&serializable_command)?)?;
+
+    // Increment the sequence and update it
+    txn.set(&next_sequence_key, &serde_json::to_vec(&(next_sequence + 1))?)?;
+
+    // Commit the transaction
+    if let Err(e) = txn.commit().await {
+        tracing::error!("Transaction commit failed: {e}. Rolling back transaction.");
+        txn.rollback();
+        return Err(anyhow::anyhow!("Failed to commit transaction: {e}"));
+    }
+    Ok(())
+}
+
+async fn read_next_uncommitted_wal_operation(store: &Store) -> Result<Option<(u64, DatabaseCommand)>> {
+    let mut txn = new_surrealkv_transaction(&store, Durability::Immediate)?;
+    let last_committed_sequence_key = RedisWALKey::LastCommittedOperationSequence.as_bytes();
+
+    // Fetch the last committed sequence
+    let last_sequence: u64 = if let Some(sequence_bytes) = txn.get(&last_committed_sequence_key)? {
+        serde_json::from_slice(&sequence_bytes)?
+    } else {
+        0 // Default to 0 if not present
+    };
+
+    // Get the next operation key
+    let next_operation_key = RedisWALKey::GetKeyForOperationSequence(last_sequence + 1).as_bytes();
+
+    // Retrieve the operation
+    if let Some(operation_bytes) = txn.get(&next_operation_key)? {
+        let message: SerializableDatabaseCommand = serde_json::from_slice(&operation_bytes)?;
+
+        // Only return uncommitted operations
+        if !message.committed_to_redis {
+            return Ok(Some((
+                last_sequence + 1,
+                message.try_into().map_err(|e: String| anyhow::anyhow!(e))?,
+            )));
+        }
+    }
+
+    Ok(None) // No uncommitted operations found
+}
+
+async fn commit_message(store: &Store, sequence: u64) -> Result<()> {
+    let mut txn = new_surrealkv_transaction(&store, Durability::Immediate)?;
+    let last_committed_sequence_key = RedisWALKey::LastCommittedOperationSequence.as_bytes();
+    let operation_key = RedisWALKey::GetKeyForOperationSequence(sequence).as_bytes();
+
+    // Fetch and update the operation
+    if let Some(existing_bytes) = txn.get(&operation_key)? {
+        let mut operation: SerializableDatabaseCommand = serde_json::from_slice(&existing_bytes)?;
+
+        // Check if the operation is already committed to Redis
+        if operation.committed_to_redis {
+            tracing::debug!(
+                "Operation with sequence {} is already committed to Redis. Possible duplicate processing.",
+                sequence
+            );
+            return Err(anyhow::anyhow!(
+                "Operation with sequence {} is already committed to Redis. Aborting.",
+                sequence
+            ));
+        }
+
+        // Update the commit flag
+        operation.committed_to_redis = true;
+
+        // Write the updated operation back to the store
+        txn.set(&operation_key, &serde_json::to_vec(&operation)?)?;
+    } else {
+        return Err(anyhow::anyhow!("Operation with sequence {} not found", sequence));
+    }
+
+    // Update the last committed sequence
+    txn.set(&last_committed_sequence_key, &serde_json::to_vec(&sequence)?)?;
+
+    // Commit the transaction with rollback on failure
+    if let Err(e) = txn.commit().await {
+        tracing::error!("Transaction commit failed for sequence {}: {e}. Rolling back transaction.", sequence);
+        txn.rollback();
+        return Err(anyhow::anyhow!("Failed to commit operation with sequence {}: {e}", sequence));
+    }
+
+    Ok(())
+}
+
+fn read_next_uncommitted_wal_operation_sync(store: &Store) -> anyhow::Result<Option<(u64, DatabaseCommand)>> {
+    let mut txn = new_surrealkv_transaction(&store, Durability::Immediate)?;
+    let last_committed_sequence_key = RedisWALKey::LastCommittedOperationSequence.as_bytes();
+
+    // Fetch the last committed sequence
+    let last_sequence: u64 = if let Some(last_bytes) = txn.get(&last_committed_sequence_key)? {
+        serde_json::from_slice(&last_bytes)?
+    } else {
+        0 // Default to 0 if not present
+    };
+
+    // Get the next operation key
+    let next_operation_key = RedisWALKey::GetKeyForOperationSequence(last_sequence + 1).as_bytes();
+
+    // Retrieve the operation
+    if let Some(operation_bytes) = txn.get(&next_operation_key)? {
+        let operation: SerializableDatabaseCommand = serde_json::from_slice(&operation_bytes)?;
+
+        // Only return uncommitted operations
+        if !operation.committed_to_redis {
+            return Ok(Some((
+                last_sequence + 1,
+                operation.try_into().map_err(|e: String| anyhow::anyhow!(e))?,
+            )));
+        }
+    }
+
+    Ok(None) // No uncommitted operations found
+}
+
+fn commit_message_sync(store: &Store, sequence: u64) -> anyhow::Result<()> {
+    let mut txn = new_surrealkv_transaction(&store, Durability::Immediate)?;
+    let last_committed_sequence_key = RedisWALKey::LastCommittedOperationSequence.as_bytes();
+    let operation_key = RedisWALKey::GetKeyForOperationSequence(sequence).as_bytes();
+
+    // Fetch and update the operation
+    if let Some(existing_bytes) = txn.get(&operation_key)? {
+        let mut operation: SerializableDatabaseCommand = serde_json::from_slice(&existing_bytes)?;
+
+        // Check if the operation is already committed to Redis
+        if operation.committed_to_redis {
+            tracing::debug!(
+                "Operation with sequence {} is already committed to Redis. Possible duplicate processing.",
+                sequence
+            );
+            return Err(anyhow::anyhow!(
+                "Operation with sequence {} is already committed to Redis. Aborting.",
+                sequence
+            ));
+        }
+
+        // Update the commit flag
+        operation.committed_to_redis = true;
+
+        // Write the updated operation back to the store
+        txn.set(&operation_key, &serde_json::to_vec(&operation)?)?;
+    } else {
+        return Err(anyhow::anyhow!("Operation with sequence {} not found", sequence));
+    }
+
+    // Update the last committed sequence
+    txn.set(&last_committed_sequence_key, &serde_json::to_vec(&sequence)?)?;
+
+    // Commit the transaction synchronously with rollback on failure
+    let result = tokio::task::block_in_place(|| {
+        tokio::runtime::Handle::current().block_on(async { txn.commit().await })
+    });
+
+    if let Err(e) = result {
+        tracing::error!("Transaction commit failed for sequence {}: {e}. Rolling back transaction.", sequence);
+        txn.rollback();
+        return Err(anyhow::anyhow!("Failed to commit operation with sequence {}: {e}", sequence));
+    }
+
+    Ok(())
+}
+
+fn is_redis_connection_alive(conn: &mut Connection) -> bool {
+    match redis::cmd("PING").query::<String>(conn) {
+        Ok(response) if response == "PONG" => true,
+        _ => false,
+    }
+}
+
+async fn shutdown_signal() {
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .expect("Failed to register SIGTERM handler");
+    let mut sigint = tokio::signal::ctrl_c();
+
+    tokio::select! {
+        _ = sigterm.recv() => {
+            tracing::info!("SIGTERM received. Initiating graceful shutdown...");
+        }
+        _ = sigint => {
+            tracing::info!("SIGINT (Ctrl+C) received. Initiating graceful shutdown...");
+        }
+    }
 }
 
 impl RedisCacheDatabase {
@@ -152,7 +455,13 @@ impl RedisCacheDatabase {
             .ok_or_else(|| anyhow::anyhow!("No database config"))?;
         let con = create_redis_connection(CACHE_READ, db_config.clone())?;
 
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<DatabaseCommand>();
+        // Store db_config in the global variable
+        {
+            let mut global_config = GLOBAL_DB_CONFIG.lock().unwrap();
+            *global_config = Some(db_config.clone());
+        }
+    
+        let (tx, rx) = tokio::sync::mpsc::channel::<DatabaseCommand>(CHANNEL_BUFFER_SIZE);
         let trader_key = get_trader_key(trader_id, instance_id, &config);
         let trader_key_clone = trader_key.clone();
 
@@ -174,9 +483,12 @@ impl RedisCacheDatabase {
     pub fn close(&mut self) {
         log::debug!("Closing");
 
-        if let Err(e) = self.tx.send(DatabaseCommand::close()) {
-            log::debug!("Error sending close message: {e:?}")
-        }
+        tokio::task::block_in_place(|| {
+            let close_command = DatabaseCommand::close();
+            if let Err(e) = get_runtime().block_on(self.tx.send(close_command)) {
+                log::debug!("Error sending close message: {e:?}");
+            }
+        });
 
         log::debug!("Awaiting task '{CACHE_WRITE}'");
         tokio::task::block_in_place(|| {
@@ -195,12 +507,16 @@ impl RedisCacheDatabase {
     }
 
     pub fn keys(&mut self, pattern: &str) -> anyhow::Result<Vec<String>> {
+        self.drain_messages_from_surrealkv()?; // Process pending messages from SurrealKV
+
         let pattern = format!("{}{REDIS_DELIMITER}{pattern}", self.trader_key);
         log::debug!("Querying keys: {pattern}");
         Ok(scan_keys(&mut self.con, pattern)?)
     }
 
     pub fn read(&mut self, key: &str) -> anyhow::Result<Vec<Bytes>> {
+        self.drain_messages_from_surrealkv()?; // Process pending messages from SurrealKV
+
         let collection = get_collection_key(key)?;
         let key = format!("{}{REDIS_DELIMITER}{}", self.trader_key, key);
 
@@ -219,125 +535,296 @@ impl RedisCacheDatabase {
         }
     }
 
-    pub fn insert(&mut self, key: String, payload: Option<Vec<Bytes>>) -> anyhow::Result<()> {
-        let op = DatabaseCommand::new(DatabaseOperation::Insert, key, payload);
-        match self.tx.send(op) {
-            Ok(_) => Ok(()),
-            Err(e) => anyhow::bail!("{FAILED_TX_CHANNEL}: {e}"),
-        }
+    fn drain_messages_from_surrealkv(&mut self) -> anyhow::Result<()> {
+        tracing::info!("Entering drain_messages_from_surrealkv for trader_key: {}", self.trader_key);
+    
+        let db_config = {
+            let global_config = GLOBAL_DB_CONFIG.lock().unwrap();
+            global_config.clone().ok_or_else(|| anyhow::anyhow!("Global db_config is not set"))?
+        };
+    
+        tracing::info!("Using db_config: {:?}", db_config);
+    
+        TOKIO_RUNTIME.block_on(async {
+            let store = create_surrealkv_store()?;
+            loop {
+                // Attempt to read the next message
+                match read_next_uncommitted_wal_operation_sync(&store)? {
+                    Some((counter, message)) => {
+                        loop {
+                            // Ensure Redis connection is alive
+                            if !is_redis_connection_alive(&mut self.con) {
+                                match create_redis_connection(CACHE_WRITE, db_config.clone()) {
+                                    Ok(new_con) => {
+                                        self.con = new_con;
+                                        tracing::info!("Redis connection reestablished.");
+                                    }
+                                    Err(e) => {
+                                        // tracing::error!("Failed to reconnect to Redis: {}. Retrying...", e);
+                                        tokio::time::sleep(std::time::Duration::from_millis(RETRY_DELAY_MS)).await;
+                                        continue;
+                                    }
+                                }
+                            }
+    
+                            // Attempt to drain the message to Redis
+                            match drain_single_message(&mut self.con, &self.trader_key, message.clone()) {
+                                Ok(_) => {
+                                    tracing::info!("Successfully drained message at counter {}", counter);
+                                    break;
+                                }
+                                Err(e) => {
+                                    tracing::warn!("Failed to drain message at counter {}: {}. Retrying...", counter, e);
+                                    tokio::time::sleep(std::time::Duration::from_millis(RETRY_DELAY_MS)).await;
+                                }
+                            }
+                        }
+    
+                        // Commit the message after successful draining
+                        if let Err(e) = commit_message_sync(&store, counter) {
+                            tracing::error!("Failed to commit message at counter {}: {}", counter, e);
+                            break;
+                        }
+                    }
+                    None => {
+                        tracing::info!("No more messages to process. Exiting...");
+                        break; // Exit the loop if there are no more messages
+                    }
+                }
+            }
+    
+            tracing::info!("Exiting drain_messages_from_surrealkv for trader_key: {}", self.trader_key);
+            Ok(())
+        })
+    }
+    
+    
+    
+
+    pub fn insert(&self, key: String, payload: Option<Vec<Bytes>>) -> anyhow::Result<()> {
+        self.send_command(DatabaseOperation::Insert, key, payload)
     }
 
-    pub fn update(&mut self, key: String, payload: Option<Vec<Bytes>>) -> anyhow::Result<()> {
-        let op = DatabaseCommand::new(DatabaseOperation::Update, key, payload);
-        match self.tx.send(op) {
-            Ok(_) => Ok(()),
-            Err(e) => anyhow::bail!("{FAILED_TX_CHANNEL}: {e}"),
-        }
+    pub fn update(&self, key: String, payload: Option<Vec<Bytes>>) -> anyhow::Result<()> {
+        self.send_command(DatabaseOperation::Update, key, payload)
     }
 
-    pub fn delete(&mut self, key: String, payload: Option<Vec<Bytes>>) -> anyhow::Result<()> {
-        let op = DatabaseCommand::new(DatabaseOperation::Delete, key, payload);
-        match self.tx.send(op) {
-            Ok(_) => Ok(()),
-            Err(e) => anyhow::bail!("{FAILED_TX_CHANNEL}: {e}"),
-        }
+    pub fn delete(&self, key: String, payload: Option<Vec<Bytes>>) -> anyhow::Result<()> {
+        self.send_command(DatabaseOperation::Delete, key, payload)
+    }
+
+    fn send_command(
+        &self,
+        operation: DatabaseOperation,
+        key: String,
+        payload: Option<Vec<Bytes>>,
+    ) -> anyhow::Result<()> {
+        // Convert payload
+        // Construct the DatabaseCommand
+        let command = DatabaseCommand::new(operation, key, payload);
+
+        // Ensure a runtime context
+        let handle = tokio::runtime::Handle::try_current().unwrap_or_else(|_| {
+            tokio::runtime::Runtime::new()
+                .expect("Failed to create Tokio runtime")
+                .handle()
+                .clone()
+        });
+
+        // Use runtime to send the command
+        let result = tokio::task::block_in_place(|| {
+            handle.block_on(async {
+                self.tx.send(command).await.map_err(|e| {
+                    anyhow::anyhow!(format!("Failed to send command: {}", e))
+                })
+            })
+        });
+
+        // Handle result
+        result.map_err(|e| anyhow::anyhow!(format!("Failed to process command: {}", e)))
     }
 }
 
 async fn process_commands(
-    mut rx: tokio::sync::mpsc::UnboundedReceiver<DatabaseCommand>,
+    mut rx: tokio::sync::mpsc::Receiver<DatabaseCommand>, // Bounded channel
     trader_key: String,
     config: CacheConfig,
 ) -> anyhow::Result<()> {
     tracing::debug!("Starting cache processing");
 
-    let db_config = config
-        .database
-        .as_ref()
-        .ok_or_else(|| anyhow::anyhow!("No database config"))?;
+    let db_config = config.database.as_ref().ok_or_else(|| anyhow::anyhow!("No database config"))?;
     let mut con = create_redis_connection(CACHE_WRITE, db_config.clone())?;
+    let store = Arc::new(create_surrealkv_store()?);
 
-    // Buffering
-    let mut buffer: VecDeque<DatabaseCommand> = VecDeque::new();
-    let mut last_drain = Instant::now();
     let buffer_interval = Duration::from_millis(config.buffer_interval_ms.unwrap_or(0) as u64);
+    let notify = Arc::new(Notify::new());
+    let shutdown_notify = notify.clone();
 
-    // Continue to receive and handle messages until channel is hung up
+    // Spawn a task to listen for shutdown signals
+    tokio::spawn({
+        let notify = notify.clone();
+        async move {
+            shutdown_signal().await;
+            notify.notify_one();
+        }
+    });
+
+    // Main loop to handle writing to SurrealKV and periodic Redis operations
     loop {
-        if last_drain.elapsed() >= buffer_interval && !buffer.is_empty() {
-            drain_buffer(&mut con, &trader_key, &mut buffer);
-            last_drain = Instant::now();
-        } else {
-            match rx.recv().await {
-                Some(msg) => {
-                    if let DatabaseOperation::Close = msg.op_type {
-                        break;
-                    }
-                    buffer.push_back(msg)
+        tokio::select! {
+            // Handle incoming messages and write to SurrealKV
+            Some(msg) = rx.recv() => {
+                // Skip storing `DatabaseOperation::Close`
+                if let DatabaseOperation::Close = msg.op_type {
+                    tracing::info!("Received DatabaseOperation::Close. Skipping SurrealKV write.");
+                    continue;
                 }
-                None => break, // Channel hung up
+
+                if let Err(e) = write_to_wal_store(&store, msg).await {
+                    tracing::error!("Failed to write to SurrealKV: {}", e);
+                }
+            }
+
+            // Periodically drain the buffer
+            _ = tokio::time::sleep(buffer_interval) => {
+                if is_redis_connection_alive(&mut con) {
+                    while let Some((counter, message)) = read_next_uncommitted_wal_operation(&store).await? {
+                        // Drain each message to Redis
+                        if let Err(e) = drain_single_message(&mut con, &trader_key, message) {
+                            tracing::error!("Failed to drain message at counter {}: {}", counter, e);
+                            break;
+                        }
+                    
+                        // Commit the message and update the counter atomically
+                        if let Err(e) = commit_message(&store, counter).await {
+                            tracing::error!("Failed to commit message at counter {}: {}", counter, e);
+                            break;
+                        }
+                    }
+                } else {
+                    if let Ok(new_con) = create_redis_connection(CACHE_WRITE, db_config.clone()) {
+                        con = new_con;
+                        tracing::info!("Redis connection reestablished.");
+                    } else {
+                        // tracing::error!("Failed to reconnect to Redis. Retrying on the next interval.");
+                        continue; // Skip draining on this iteration
+                    }
+                }
+            }
+
+            // Handle shutdown signal
+            _ = shutdown_notify.notified() => {
+                tracing::info!("Shutdown notifier triggered. Cleaning up...");
+                break;
             }
         }
-    }
-
-    // Drain any remaining messages
-    if !buffer.is_empty() {
-        drain_buffer(&mut con, &trader_key, &mut buffer);
     }
 
     tracing::debug!("Stopped cache processing");
     Ok(())
 }
 
-fn drain_buffer(conn: &mut Connection, trader_key: &str, buffer: &mut VecDeque<DatabaseCommand>) {
+fn drain_single_message(conn: &mut Connection, trader_key: &str, msg: DatabaseCommand) -> Result<()> {
     let mut pipe = redis::pipe();
     pipe.atomic();
 
-    for msg in buffer.drain(..) {
-        let key = msg.key.expect("Null command `key`");
-        let collection = match get_collection_key(&key) {
-            Ok(collection) => collection,
-            Err(e) => {
-                tracing::error!("{e}");
-                continue; // Continue to next message
-            }
-        };
+    let key = msg.key.expect("Null command key");
+    let collection = get_collection_key(&key)?;
+    let redis_key = format!("{trader_key}{REDIS_DELIMITER}{}", &key);
 
-        let key = format!("{trader_key}{REDIS_DELIMITER}{}", &key);
-
-        match msg.op_type {
-            DatabaseOperation::Insert => {
-                if let Some(payload) = msg.payload {
-                    if let Err(e) = insert(&mut pipe, collection, &key, payload) {
-                        tracing::error!("{e}");
-                    }
-                } else {
-                    tracing::error!("Null `payload` for `insert`");
-                }
+    match msg.op_type {
+        DatabaseOperation::Insert => {
+            if let Some(payload) = msg.payload {
+                insert(&mut pipe, collection, &redis_key, payload)?;
             }
-            DatabaseOperation::Update => {
-                if let Some(payload) = msg.payload {
-                    if let Err(e) = update(&mut pipe, collection, &key, payload) {
-                        tracing::error!("{e}");
-                    }
-                } else {
-                    tracing::error!("Null `payload` for `update`");
-                };
+        }
+        DatabaseOperation::Update => {
+            if let Some(payload) = msg.payload {
+                update(&mut pipe, collection, &redis_key, payload)?;
             }
-            DatabaseOperation::Delete => {
-                // `payload` can be `None` for a delete operation
-                if let Err(e) = delete(&mut pipe, collection, &key, msg.payload) {
-                    tracing::error!("{e}");
-                }
-            }
-            DatabaseOperation::Close => panic!("Close command should not be drained"),
+        }
+        DatabaseOperation::Delete => {
+            delete(&mut pipe, collection, &redis_key, msg.payload)?;
+        }
+        _ => {
+            tracing::warn!("Unsupported operation in drain: {:?}", msg.op_type);
         }
     }
 
-    if let Err(e) = pipe.query::<()>(conn) {
-        tracing::error!("{e}");
-    }
+    pipe.query::<()>(conn).map_err(|e| anyhow::anyhow!("Redis pipeline query failed: {e}"))?;
+    tracing::info!("Successfully processed command for key: {}", redis_key);
+    Ok(())
 }
+
+
+// fn drain_buffer(conn: &mut Connection, trader_key: &str, buffer: &mut VecDeque<DatabaseCommand>) {
+//     if !is_redis_connection_alive(conn) {
+//         tracing::error!("Redis connection is not alive. Buffer remains in SurrealKV.");
+//         return;
+//     }
+
+//     if !buffer.is_empty() {
+//         tracing::info!("Processing combined buffer with {} commands.", buffer.len());
+//         let mut pipe = redis::pipe();
+//         pipe.atomic();
+
+//         for (i, msg) in buffer.drain(..).enumerate() {
+//             if msg.key.is_none() || msg.payload.is_none() {
+//                 tracing::error!("Malformed command #{}", i + 1);
+//                 continue;
+//             }
+
+//             let key = msg.key.expect("Null command key");
+//             let collection = match get_collection_key(&key) {
+//                 Ok(collection) => collection,
+//                 Err(e) => {
+//                     tracing::error!("Failed to get collection key for command #{}: {}", i + 1, e);
+//                     continue;
+//                 }
+//             };
+
+//             let key = format!("{trader_key}{REDIS_DELIMITER}{}", &key);
+
+//             match msg.op_type {
+//                 DatabaseOperation::Insert => {
+//                     if let Some(payload) = msg.payload {
+//                         if let Err(e) = insert(&mut pipe, collection, &key, payload) {
+//                             tracing::error!("Failed to insert data for command #{}: {}", i + 1, e);
+//                         }
+//                     } else {
+//                         tracing::error!("Null payload for insert in command #{}", i + 1);
+//                     }
+//                 }
+//                 DatabaseOperation::Update => {
+//                     if let Some(payload) = msg.payload {
+//                         if let Err(e) = update(&mut pipe, collection, &key, payload) {
+//                             tracing::error!("Failed to update data for command #{}: {}", i + 1, e);
+//                         }
+//                     } else {
+//                         tracing::error!("Null payload for update in command #{}", i + 1);
+//                     };
+//                 }
+//                 DatabaseOperation::Delete => {
+//                     if let Err(e) = delete(&mut pipe, collection, &key, msg.payload) {
+//                         tracing::error!("Failed to delete data for command #{}: {}", i + 1, e);
+//                     }
+//                 }
+//                 DatabaseOperation::Close => {
+//                     tracing::error!("Close command should not be drained. Command #{}", i + 1);
+//                     continue;
+//                 }
+//             }
+//         }
+
+//         if let Err(e) = pipe.query::<()>(conn) {
+//             tracing::error!("Redis pipeline query failed: {e}");
+//         } else {
+//             tracing::info!("Successfully processed all commands in the combined buffer.");
+//         }
+//     } else {
+//         tracing::info!("No commands to process. Buffer is empty.");
+//     }
+// }
 
 fn scan_keys(con: &mut Connection, pattern: String) -> Result<Vec<String>, RedisError> {
     Ok(con.scan_match::<String, String>(pattern)?.collect())
@@ -781,6 +1268,7 @@ impl CacheDatabaseAdapter for RedisCacheDatabaseAdapter {
     }
 
     fn load_positions(&mut self) -> anyhow::Result<HashMap<PositionId, Position>> {
+        self.database.drain_messages_from_surrealkv()?;
         let mut positions = HashMap::new();
         let pattern = format!("{POSITIONS}*");
 
