@@ -556,7 +556,7 @@ class DYDXWsSubaccountsSubscribedContents(msgspec.Struct, forbid_unknown_fields=
             currency = Currency.from_str(DEFAULT_CURRENCY)
             free = Decimal(self.subaccount.freeCollateral)
             total = Decimal(self.subaccount.equity)
-            locked = total - free
+            locked = Decimal(total - free)
 
             return [
                 AccountBalance(

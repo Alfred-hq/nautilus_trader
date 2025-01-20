@@ -3,7 +3,6 @@ name: Build and Push Docker Images
 on:
   push:
     branches:
-      - master-production
       - releases_production
       - pre-production
 
