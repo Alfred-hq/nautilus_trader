@@ -120,9 +120,18 @@ class KMSHttpClient:
         return urllib.parse.urlencode(payload_list)
 
     def get_auth_token(self) -> str:
+        self._log.debug(f" base url in auth token  : {self.base_url}", LogColor.MAGENTA)
+        self._log.info(f" base url in auth token : {self.base_url}", LogColor.MAGENTA)
+        self._log.error(f" base url in auth token  {self.base_url}", LogColor.MAGENTA)
         audience = self.base_url
         auth_req = google.auth.transport.requests.Request()
+        self._log.debug(f" auth_req  : {auth_req}", LogColor.MAGENTA)
+        self._log.info(f" auth_req : {auth_req}", LogColor.MAGENTA)
+        self._log.error(f" auth_req  {auth_req}", LogColor.MAGENTA)
         id_token = google.oauth2.id_token.fetch_id_token(auth_req, audience)
+        self._log.debug(f" id_token  : {id_token}", LogColor.MAGENTA)
+        self._log.info(f" id token : {id_token}", LogColor.MAGENTA)
+        self._log.error(f" id_token  {id_token}", LogColor.MAGENTA)
         return id_token
 
     async def send_request(
