@@ -554,8 +554,9 @@ class DYDXWsSubaccountsSubscribedContents(msgspec.Struct, forbid_unknown_fields=
 
         if self.subaccount is not None:
             currency = Currency.from_str(DEFAULT_CURRENCY)
-            free = Decimal(self.subaccount.freeCollateral)
-            total = Decimal(self.subaccount.equity)
+            free = Decimal(f"{Decimal(self.subaccount.freeCollateral):.8f}")
+            total = Decimal(f"{Decimal(self.subaccount.equity):.8f}")
+            free, total = self.truncate_to_minimal_decimal_length(free, total)
             locked = Decimal(total - free)
 
             return [
@@ -567,6 +568,23 @@ class DYDXWsSubaccountsSubscribedContents(msgspec.Struct, forbid_unknown_fields=
             ]
 
         return account_balances
+
+    def truncate_to_minimal_decimal_length(self, val1: Decimal, val2: Decimal) -> tuple[Decimal, Decimal]:
+        """
+        Truncate both decimals to the minimal length after the decimal point.
+        """
+        str_val1 = str(val1)
+        str_val2 = str(val2)
+
+        len_decimals_1 = len(str_val1.split(".")[1]) if "." in str_val1 else 0
+        len_decimals_2 = len(str_val2.split(".")[1]) if "." in str_val2 else 0
+
+        min_decimal_length = min(len_decimals_1, len_decimals_2)
+
+        truncated_val1 = Decimal(f"{val1:.{min_decimal_length}f}")
+        truncated_val2 = Decimal(f"{val2:.{min_decimal_length}f}")
+
+        return truncated_val1, truncated_val2
 
 
 class DYDXWsSubaccountsSubscribed(msgspec.Struct, forbid_unknown_fields=True):

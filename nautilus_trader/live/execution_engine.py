@@ -473,8 +473,11 @@ class LiveExecutionEngine(ExecutionEngine):
     async def _open_check_loop(self, interval_secs: float) -> None:
         try:
             while True:
+                self._log.info(f"Sleeping for {interval_secs} second in Open Order Check Loop")
                 await asyncio.sleep(interval_secs)
+                self._log.info("Sleeping is Done for Open Order Check Loop")
                 await self._check_open_orders()
+                self._log.info("Open orders are checked Successfully")
         except asyncio.CancelledError:
             self._log.debug("Open check loop task canceled")
 
