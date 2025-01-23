@@ -75,6 +75,7 @@ class DYDXPerpetualMarketResponseObject(msgspec.Struct, forbid_unknown_fields=Tr
     subticksPerTick: int
     marketType: DYDXPerpetualMarketType
     baseOpenInterest: str
+    defaultFundingRate1H:str|None = None
     oraclePrice: str | None = None
     openInterestLowerCap: str | None = None
     openInterestUpperCap: str | None = None
