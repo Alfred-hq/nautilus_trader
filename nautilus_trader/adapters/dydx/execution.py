@@ -957,6 +957,10 @@ class DYDXExecutionClient(LiveExecutionClient):
             else Money(Decimal(0), instrument.quote_currency)
         )
 
+        if Decimal(fill_msg.price).is_zero():
+            self._log.error(f"Fill message with zero price: Venue Order ID{venue_order_id} and Client Order ID {client_order_id}")
+            return
+
         self.generate_order_filled(
             strategy_id=order.strategy_id,
             instrument_id=instrument_id,
