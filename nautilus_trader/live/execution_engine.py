@@ -494,20 +494,41 @@ class LiveExecutionEngine(ExecutionEngine):
         instruments = {order_id: self._cache.instrument(
             self._cache.order(order_id).instrument_id)
                       for order_id in open_order_ids}
-        # Create tasks for each client and open order combination
-        tasks = []
+
+        # Group open orders by venue
+        orders_by_venue = {}
+        for order_id in open_order_ids:
+            order = self._cache.order(order_id)
+            venue = order.instrument_id.venue
+            if venue not in orders_by_venue:
+                orders_by_venue[venue] = []
+            orders_by_venue[venue].append(order_id)
+
+        # Process orders sequentially
+        all_order_reports = []
         for client in self._clients.values():
-            self._log.info(f"Checking open orders for {client}")
-            for order_id in open_order_ids:
+            client_venue = client.venue
+            venue_orders = orders_by_venue.get(client_venue, [])
+            if not venue_orders:
+                self._log.info(f"No open orders for client {client} (venue {client_venue})")
+                continue
+
+            self._log.info(f"Processing {len(venue_orders)} open orders for {client} (venue {client_venue})")
+            for order_id in venue_orders:
                 self._log.info(f"Checking open order {order_id}")
                 instrument_id = instruments[order_id].id
-                tasks.append(client.generate_order_status_report(
+
+                report = await client.generate_order_status_report(
                     instrument_id=instrument_id,
                     client_order_id=order_id,
-                ))
-            self._log.info(f"Updated {len(tasks)} order reports for {client}")
-        order_reports_all = await asyncio.gather(*tasks)
-        all_order_reports = [r for reports in order_reports_all for r in reports]
+                )
+                if report:
+                    all_order_reports.append(report)
+                    self._log.info(f"Successfully retrieved report for {order_id}")
+                else:
+                    self._log.warning(f"Failed to get report for {order_id}")
+                self._log.debug(f"Processed order {order_id}")
+            self._log.info(f"Completed {len(venue_orders)} orders for {client}")
 
         for report in all_order_reports:
             if not report.is_open and report.client_order_id in open_order_ids:
