@@ -486,12 +486,26 @@ class LiveExecutionEngine(ExecutionEngine):
 
         open_order_ids: list[ClientOrderId] = self._cache.client_order_ids_open()
         open_len = len(open_order_ids)
-        self._log.debug(f"Found {open_len} order{'' if open_len == 1 else 's'} open")
+        self._log.info(f"Found {open_len} order{'' if open_len == 1 else 's'} open")
 
         if not open_order_ids:
             return  # Nothing further to check
 
-        tasks = [c.generate_order_status_reports(open_only=True) for c in self._clients.values()]
+        instruments = {order_id: self._cache.instrument(
+            self._cache.order(order_id).instrument_id)
+                      for order_id in open_order_ids}
+        # Create tasks for each client and open order combination
+        tasks = []
+        for client in self._clients.values():
+            self._log.info(f"Checking open orders for {client}")
+            for order_id in open_order_ids:
+                self._log.info(f"Checking open order {order_id}")
+                instrument_id = instruments[order_id].id
+                tasks.append(client.generate_order_status_report(
+                    instrument_id=instrument_id,
+                    client_order_id=order_id,
+                ))
+            self._log.info(f"Updated {len(tasks)} order reports for {client}")
         order_reports_all = await asyncio.gather(*tasks)
         all_order_reports = [r for reports in order_reports_all for r in reports]
 
