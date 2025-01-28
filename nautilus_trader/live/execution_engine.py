@@ -505,7 +505,6 @@ class LiveExecutionEngine(ExecutionEngine):
             orders_by_venue[venue].append(order_id)
 
         # Process orders sequentially
-        all_order_reports = []
         for client in self._clients.values():
             client_venue = client.venue
             venue_orders = orders_by_venue.get(client_venue, [])
@@ -523,16 +522,15 @@ class LiveExecutionEngine(ExecutionEngine):
                     client_order_id=order_id,
                 )
                 if report:
-                    all_order_reports.append(report)
                     self._log.info(f"Successfully retrieved report for {order_id}")
+
+                    if not report.is_open and report.client_order_id in open_order_ids:
+                        self._reconcile_order_report(report, trades=[])
                 else:
                     self._log.warning(f"Failed to get report for {order_id}")
                 self._log.debug(f"Processed order {order_id}")
+                await asyncio.sleep(1)
             self._log.info(f"Completed {len(venue_orders)} orders for {client}")
-
-        for report in all_order_reports:
-            if not report.is_open and report.client_order_id in open_order_ids:
-                self._reconcile_order_report(report, trades=[])
 
     # -- RECONCILIATION -------------------------------------------------------------------------------
 
