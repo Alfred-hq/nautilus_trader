@@ -509,12 +509,12 @@ class LiveExecutionEngine(ExecutionEngine):
             client_venue = client.venue
             venue_orders = orders_by_venue.get(client_venue, [])
             if not venue_orders:
-                self._log.info(f"No open orders for client {client} (venue {client_venue})")
+                self._log.warning(f"No open orders for client {client} (venue {client_venue})")
                 continue
 
             self._log.info(f"Processing {len(venue_orders)} open orders for {client} (venue {client_venue})")
             for order_id in venue_orders:
-                self._log.info(f"Checking open order {order_id}")
+                self._log.debug(f"Checking open order {order_id}")
                 instrument_id = instruments[order_id].id
 
                 report = await client.generate_order_status_report(
@@ -823,6 +823,7 @@ class LiveExecutionEngine(ExecutionEngine):
 
         if report.avg_px is None:
             self._log.warning("report.avg_px was `None` when a value was expected")
+            return False
 
         # Check reported filled qty against order filled qty
         if report.filled_qty != order.filled_qty:
