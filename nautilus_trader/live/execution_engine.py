@@ -823,6 +823,7 @@ class LiveExecutionEngine(ExecutionEngine):
 
         if report.avg_px is None:
             self._log.warning("report.avg_px was `None` when a value was expected")
+            return False
 
         # Check reported filled qty against order filled qty
         if report.filled_qty != order.filled_qty:
