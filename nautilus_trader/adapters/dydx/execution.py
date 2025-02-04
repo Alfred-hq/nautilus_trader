@@ -464,8 +464,7 @@ class DYDXExecutionClient(LiveExecutionClient):
             fills_report = await self.generate_fill_reports(
                 instrument_id=instrument_id,
                 venue_order_id=venue_order_id,
-                start=order.ts_event,
-                end=self._clock.timestamp_ns(),
+                end=order.ts_event,
             )
 
             if report and fills_report:
