@@ -102,6 +102,19 @@ static TOKIO_RUNTIME: Lazy<Runtime> = Lazy::new(|| {
 });
 
 static GLOBAL_DB_CONFIG: Lazy<Mutex<Option<DatabaseConfig>>> = Lazy::new(|| Mutex::new(None));
+lazy_static::lazy_static! {
+    static ref IS_SURREAL_DIRTY: Mutex<bool> = Mutex::new(true); // Initially set to true
+}
+
+fn set_global_surreal_dirty_flag(value: bool) {
+    let mut flag = IS_SURREAL_DIRTY.lock().unwrap();
+    *flag = value; // Set the flag to the given value (true or false)
+}
+
+fn get_global_surreal_dirty_flag() -> bool {
+    let flag = IS_SURREAL_DIRTY.lock().unwrap();
+    *flag // Return the current value of the flag
+}
 
 enum RedisWALKey {
     NextOperationSequence,          // Key for the next sequence ID to be used for a new operation
@@ -266,6 +279,7 @@ async fn write_to_wal_store(store: &Store, message: DatabaseCommand) -> Result<(
         txn.rollback();
         return Err(anyhow::anyhow!("Failed to commit transaction: {e}"));
     }
+    set_global_surreal_dirty_flag(true);
     Ok(())
 }
 
@@ -516,7 +530,12 @@ impl RedisCacheDatabase {
     }
 
     pub fn read(&mut self, key: &str) -> anyhow::Result<Vec<Bytes>> {
-        self.drain_messages_from_surrealkv()?; // Process pending messages from SurrealKV
+        if get_global_surreal_dirty_flag() {
+            tracing::debug!("draining as surreal is dirty");
+            self.drain_messages_from_surrealkv()?; // Process pending messages from SurrealKV
+        } else {
+            tracing::debug!("surreal is not dirty");
+        }
         tracing::debug!("Reading keys");
 
         let collection = get_collection_key(key)?;
@@ -589,6 +608,7 @@ impl RedisCacheDatabase {
                         }
                     }
                     None => {
+                        set_global_surreal_dirty_flag(false);
                         tracing::info!("No more messages to process. Exiting...");
                         break; // Exit the loop if there are no more messages
                     }
