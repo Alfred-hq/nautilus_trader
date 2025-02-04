@@ -461,6 +461,25 @@ class DYDXExecutionClient(LiveExecutionClient):
                 venue_order_id=venue_order_id,
                 order_side=order.side,
             )
+            fills_report = await self.generate_fill_reports(
+                instrument_id=instrument_id,
+                venue_order_id=venue_order_id,
+                end=order.ts_event,
+            )
+
+            if report and fills_report:
+                matching_fills = [fill for fill in fills_report if fill.venue_order_id == venue_order_id]
+                if matching_fills:
+                    # Calculate average price and total quantity from fills
+                    total_qty = sum(fill.last_qty.as_decimal() for fill in matching_fills)
+                    weighted_price = sum(fill.last_px.as_decimal() * fill.last_qty.as_decimal() for fill in matching_fills)
+                    avg_price = weighted_price / total_qty if total_qty > 0 else None
+
+                    if avg_price:
+                        report.avg_px = Price(avg_price, report.price.precision)
+                        report.quantity = Quantity(total_qty, report.quantity.precision)
+
+            self._log.info(f"Report: {report}")
 
         except DYDXError as e:
             retries += 1
