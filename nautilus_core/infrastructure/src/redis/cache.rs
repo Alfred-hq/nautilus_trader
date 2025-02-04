@@ -95,6 +95,7 @@ const INDEX_POSITIONS_CLOSED: &str = "index:positions_closed";
 const SURREAL_KV_DIR: &str = "./nautilus_embedded_storage";
 const CHANNEL_BUFFER_SIZE: usize = 1;
 const RETRY_DELAY_MS: u64 = 2000; // Define delay between retries in milliseconds
+const REDIS_SCAN_BATCH_SIZE: usize = 100;
 
 static TOKIO_RUNTIME: Lazy<Runtime> = Lazy::new(|| {
     Runtime::new().expect("Failed to create global Tokio runtime")
@@ -510,12 +511,13 @@ impl RedisCacheDatabase {
         self.drain_messages_from_surrealkv()?; // Process pending messages from SurrealKV
 
         let pattern = format!("{}{REDIS_DELIMITER}{pattern}", self.trader_key);
-        log::debug!("Querying keys: {pattern}");
+        tracing::debug!("Querying keys: {pattern}");
         Ok(scan_keys(&mut self.con, pattern)?)
     }
 
     pub fn read(&mut self, key: &str) -> anyhow::Result<Vec<Bytes>> {
         self.drain_messages_from_surrealkv()?; // Process pending messages from SurrealKV
+        tracing::debug!("Reading keys");
 
         let collection = get_collection_key(key)?;
         let key = format!("{}{REDIS_DELIMITER}{}", self.trader_key, key);
@@ -756,7 +758,6 @@ fn drain_single_message(conn: &mut Connection, trader_key: &str, msg: DatabaseCo
     Ok(())
 }
 
-
 // fn drain_buffer(conn: &mut Connection, trader_key: &str, buffer: &mut VecDeque<DatabaseCommand>) {
 //     if !is_redis_connection_alive(conn) {
 //         tracing::error!("Redis connection is not alive. Buffer remains in SurrealKV.");
@@ -827,7 +828,31 @@ fn drain_single_message(conn: &mut Connection, trader_key: &str, msg: DatabaseCo
 // }
 
 fn scan_keys(con: &mut Connection, pattern: String) -> Result<Vec<String>, RedisError> {
-    Ok(con.scan_match::<String, String>(pattern)?.collect())
+    tracing::info!("Entering scan_keys");
+
+    let mut keys = Vec::new();
+    let mut cursor: u64 = 0;
+
+    loop {
+        let (new_cursor, batch): (u64, Vec<String>) = redis
+            ::cmd("SCAN")
+            .cursor_arg(cursor)
+            .arg("MATCH")
+            .arg(&pattern) // Borrowing pattern
+            .arg("COUNT")
+            .arg(REDIS_SCAN_BATCH_SIZE) // Default batch size
+            .query(con)?;
+
+        keys.extend(batch);
+        cursor = new_cursor;
+
+        if cursor == 0 {
+            break;
+        }
+    }
+
+    tracing::info!("Exiting scan_keys with {} keys found", keys.len());
+    Ok(keys)
 }
 
 fn read_index(conn: &mut Connection, key: &str) -> anyhow::Result<Vec<Bytes>> {
